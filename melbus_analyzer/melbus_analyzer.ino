@@ -3,100 +3,118 @@
  * Jesus Trujillo <elyeyus@gmail.com>
  *
  * Pin Assignments
- *    MDATA - Pin 3
- *    MCLK - Pin 2
- *    MBUSY - Pin 4
+ *    MCLK - Pin 2 (PD2) (INT0) (PCINT18)
+ *    MBUSY - Pin 3 (PD3) (INT1) (PCINT19)
+ *    MDATA - Pin 4 (PD4) (T0) (PCINT20)
  */
 
-#define MDATA 3
+#include <stdint.h>
+#include <avr/io.h>
+#include <avr/interrupt.h>
+
 #define MCLK 2
-#define MBUSY 4
+#define MBUSY 3
+#define MDATA 4
 
-volatile byte mByte;
-volatile unsigned int bitCount = 0;
-unsigned int bps = 0;
+#define DEBUG 1
 
-volatile boolean prevMBUSYstatus = HIGH;
-volatile boolean didMBUSYchange = false;
-volatile boolean newByte = false;
+#ifdef DEBUG
+#define DBG_INT0 5
+#define DBG_INT1 6
+#define DBG_TIM1 7
+#endif
+
+// melbus state
+volatile uint8_t melbus_clock = 7;
+volatile uint8_t melbus_data = 0;
 
 void setup() 
 {
-  // Configure timer0
+  // Set up interrupts to read MELBUS
   cli();
-  //set timer0 interrupt at 100Hz~
-  TCCR0A = 0;// set entire TCCR0A register to 0
-  TCCR0B = 0;// same for TCCR0B
-  TCNT0  = 0;//initialize counter value to 0
-  // set compare match register for 100Hz~ increments
-  OCR0A = 155;// = (16*10^6) / (100*1024) - 1 (must be <256)
-  // turn on CTC mode
-  TCCR0A |= (1 << WGM01);
-  // Set CS01 and CS00 bits for 1024 prescaler
-  TCCR0B |= (1 << CS02) | (0 << CS01) | (1 << CS00);   
-  // enable timer compare interrupt
-  TIMSK0 |= (1 << OCIE0A);
+
+  // Set up external interrupt to catch MBUSY and MCLK state changes
+  EIMSK = 1<<INT1 | 1<<INT0;  // Enable INT0&INT1
+  EICRA = 0<<ISC11 | 1<<ISC10 | 0<<ISC01 | 1<<ISC00; // Trigger INT0&INT1 on level change
+
+  // Enable timer1 interrupt
+  TIMSK1 |= (1 << TOIE1);
   sei();
   
   // Initialize serial port
   Serial.begin(115200,SERIAL_8N1);
-  
+  Serial.println("--- Melbus Analyzer ---");
   pinMode(MBUSY,INPUT);
-  attachInterrupt(0,melbus_clock_isr,FALLING);
+  pinMode(MCLK,INPUT);
+  pinMode(MDATA,INPUT);
+  
+  #ifdef DEBUG
+  pinMode(DBG_INT0, OUTPUT);
+  pinMode(DBG_INT1, OUTPUT);
+  pinMode(DBG_TIM1, OUTPUT);
+  digitalWrite(DBG_INT0, LOW);
+  digitalWrite(DBG_INT1, LOW);
+  digitalWrite(DBG_TIM1, LOW);
+  #endif
 }
 
 void loop() 
-{
+{}
+
+//MCLK change
+ISR(INT0_vect) {
+  // Preload timer will give around 30us timeout should be enough even with
+  // slower clock coming from CD module
+  TCNT1 = 0xFE1F;
+  // Start timer without prescaler F_CPU/1
+  TCCR1B |= (1 << CS10);
+
+  #ifdef DEBUG
+  digitalWrite(DBG_INT0, HIGH);
+  #endif
   
-  // Print the status of the MBUSY line when changes
-  if(didMBUSYchange) {
-    Serial.println("MBUSY: ");
-    Serial.print(prevMBUSYstatus, BIN);
-    didMBUSYchange = false;
+  if (digitalRead(MCLK)) {
+    if (digitalRead(MDATA)) {
+      melbus_data |= (1 << melbus_clock);
+    } else {
+      melbus_data &= ~(1 << melbus_clock);
+    }	
+    
+    melbus_clock--;
   }
   
-  // Print bus speed
-  Serial.println("BPS: ");
-  Serial.print(bps);
-  
-  // Print last byte
-  Serial.println("DATA: ");
-  Serial.print(mByte, HEX);
-  newByte = false;
-  
+  #ifdef DEBUG
+  digitalWrite(DBG_INT0, LOW);
+  #endif
 }
 
-boolean melbus_is_busy()
-{
-  return digitalRead(MBUSY);
+// MBUSY change
+ISR(INT1_vect) {
+  #ifdef DEBUG
+  digitalWrite(DBG_INT1, HIGH);
+  #endif
+  
+  Serial.print("\n");
+  
+  #ifdef DEBUG
+  digitalWrite(DBG_INT1, LOW);
+  #endif
 }
 
-/**
- * melbus_clock_isr
- * Takes care of signaling the melbus clock so data bit capture could be performed
- */
-void melbus_clock_isr() 
-{
-  // Track MBUSY line
-  if(prevMBUSYstatus != melbus_is_busy()) {
-    didMBUSYchange = true;
-    prevMBUSYstatus = melbus_is_busy();
-  }
+//Timer overflow 30us after last bit, it should clear the timer and mark the end of a byte
+ISR(TIMER1_OVF_vect) {
+  #ifdef DEBUG
+  digitalWrite(DBG_TIM1, HIGH);
+  #endif
   
-  bitCount++;
-  
-  if(bitCount%8 == 0 && bitCount > 0) {
-    newByte = true;
-  }
-  // push value of MDATA into mByte
-  mByte = mByte<<1;
-  mByte |= 0x01&digitalRead(MDATA); 
-  
-}
+  Serial.print(melbus_data, HEX);
+  Serial.print(" ");
+  melbus_clock = 7;
 
-ISR(TIMER0_COMPA_vect)
-{
-    // reset bit count
-    bps = bitCount*100;
-    bitCount = 0;
+  //Stop timer
+  TCCR1B &= ~(1 << CS10);
+  
+  #ifdef DEBUG
+  digitalWrite(DBG_TIM1, LOW);
+  #endif
 }
